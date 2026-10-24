@@ -120,7 +120,9 @@ class MirrorDisplay:
         self.particles: list[Particle] = []
         self.sprites = Sprites()
         self.debug = False
-        self._fonts: dict[int, pygame.font.Font] = {}
+        self.caption: str | None = None  # what the hat is currently saying (set from the show thread)
+        self.caption_t0 = 0.0
+        self._fonts: dict[tuple[bool, int], pygame.font.Font] = {}
         self._text_cache: dict[tuple[str, int, Color, Color | None], pygame.Surface] = {}
         self._crest_cache: dict[tuple[str, int], pygame.Surface] = {}
         self._spawn_acc = 0.0
@@ -133,6 +135,11 @@ class MirrorDisplay:
     def post(self, state: str, person: Person | None) -> None:
         """Called from any thread (show controller)."""
         self._events.put((state, person))
+
+    def set_caption(self, text: str | None) -> None:
+        """Show what the hat is saying under the thinking ring (None = clear)."""
+        self.caption = text
+        self.caption_t0 = time.monotonic()
 
     # ------------------------------------------------------------------ setup
 
@@ -161,11 +168,14 @@ class MirrorDisplay:
         log.info("display %dx%d (canvas %dx%d, rotate %d)", sw, sh, self.W, self.H, self.dcfg.rotate)
         self._report_crests()
 
-    def font(self, size: int) -> pygame.font.Font:
-        f = self._fonts.get(size)
+    def font(self, size: int, title: bool = False) -> pygame.font.Font:
+        """Body font, or the display face for headings (falls back to the body font)."""
+        key = (title, size)
+        f = self._fonts.get(key)
         if f is None:
-            path = self.dcfg.font
-            if path:
+            for path in ((self.dcfg.title_font, self.dcfg.font) if title else (self.dcfg.font,)):
+                if not path:
+                    continue
                 p = Path(path)
                 if not p.is_absolute():
                     p = self.cfg.resolve(self.cfg.paths.assets) / p
@@ -173,11 +183,12 @@ class MirrorDisplay:
                         p = self.cfg.resolve(path)
                 try:
                     f = pygame.font.Font(str(p), size)
-                except (OSError, FileNotFoundError):
-                    log.warning("font %s not found, using system serif", path)
+                    break
+                except (OSError, FileNotFoundError) as e:
+                    log.warning("font %s unusable (%s)", path, e)
             if f is None:
                 f = pygame.font.SysFont("cinzel,garamond,palatino,georgia,dejavuserif,liberationserif,serif", size)
-            self._fonts[size] = f
+            self._fonts[key] = f
         return f
 
     # ------------------------------------------------------------------ main loop
@@ -226,6 +237,7 @@ class MirrorDisplay:
     def _enter(self, state: str, person: Person | None) -> None:
         self.state, self.person = state, person
         self.state_t0 = time.monotonic()
+        self.caption = None
         if state == "thinking":
             self.particles.clear()
             self._phrase_order = random.sample(self.dcfg.thinking_phrases, len(self.dcfg.thinking_phrases))
@@ -332,12 +344,35 @@ class MirrorDisplay:
             p.y = self.fy + math.sin(phase) * r * 0.82
         pulse = 0.5 + 0.5 * math.sin(t * 3.2)
         self._blit_halo(GOLD, int(220 * u), (0.12 + 0.12 * pulse) * ramp(t, 0, 0.8))
+        if self.caption:  # the hat's actual line, wrapped under the ring
+            a = min((time.monotonic() - self.caption_t0) / 0.6, 1.0)
+            size = int(44 * u)
+            maxw = int(self.W * 0.88)
+            lines = self._wrap(self.caption, self.font(size), maxw)[:4]
+            lh = int(size * 1.3)
+            y0 = self.fy + 330 * u - (len(lines) - 1) * lh / 2
+            for j, ln in enumerate(lines):
+                self._blit_text(ln, size, GOLD, self.fx, y0 + j * lh, a * 0.95)
+            return
         phrases = self._phrase_order or ["Hmm..."]
         per = 2.4
         idx = int(t // per) % len(phrases)
         local = t % per
         a = min(local / 0.5, 1.0, (per - local) / 0.5) * ramp(t, 0.6, 0.6)
         self._blit_text(phrases[idx], int(58 * u), GOLD, self.fx, self.fy + 330 * u, a * 0.85)
+
+    def _wrap(self, text: str, font: pygame.font.Font, maxw: int) -> list[str]:
+        words, lines, cur = text.split(), [], ""
+        for w in words:
+            joined = f"{cur} {w}".strip()
+            if not cur or font.size(joined)[0] <= maxw:
+                cur = joined
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        return lines
 
     # ------------------------------------------------------------------ reveal
 
@@ -365,8 +400,10 @@ class MirrorDisplay:
         # colour wash: bright flash that settles into a slow pulse
         flash = 1 - ramp(t, 0, 1.0)
         pulse = 0.5 + 0.5 * math.sin(t * 1.6)
-        self._blit_halo(prim, int(620 * u), (0.30 + 0.45 * flash + 0.08 * pulse) * fade, cy)
-        self._blit_halo((255, 255, 255), int(260 * u), 0.5 * flash, cy)
+        self._blit_halo(prim, int(760 * u), (0.30 + 0.45 * flash + 0.08 * pulse) * fade, cy)
+        self._blit_halo((255, 255, 255), int(320 * u), 0.5 * flash, cy)
+        # faint wash anchoring the title block into the lower half of a tall screen
+        self._blit_halo(prim, int(700 * u), (0.09 + 0.04 * pulse) * fade, cy + 460 * u)
 
         # trickle of embers rising off the crest
         self._spawn_acc += dt * 14
@@ -374,12 +411,12 @@ class MirrorDisplay:
             self._spawn_acc -= 1
             life = random.uniform(2, 4)
             self.particles.append(Particle(
-                x=random.gauss(self.fx, 160 * u), y=cy + random.uniform(-120, 200) * u,
+                x=random.gauss(self.fx, 190 * u), y=cy + random.uniform(-160, 260) * u,
                 vx=random.uniform(-15, 15) * u, vy=random.uniform(-90, -40) * u, life=life, max_life=life,
                 radius=int(random.uniform(4, 10) * u) + 2, color=random.choice([prim, sec]), twinkle=5))
 
         # crest
-        size = int(400 * u)
+        size = int(520 * u)
         scale = ease_out_back(ramp(t, 0.1, 0.9))
         if scale > 0.02:
             crest = self._crest(house, size)
@@ -390,13 +427,13 @@ class MirrorDisplay:
 
         # names
         if person.name:
-            self._blit_text(person.name, int(72 * u), (255, 245, 225), self.fx, self.fy - 140 * u,
-                            ramp(t, 0.3, 0.7) * fade, glow=sec)
-        self._blit_text(house.label.upper(), int(120 * u), sec, self.fx, cy + 300 * u,
-                        ramp(t, 0.5, 0.8) * fade, glow=prim)
+            self._blit_text(person.name, int(84 * u), (255, 245, 225), self.fx, self.fy - 175 * u,
+                            ramp(t, 0.3, 0.7) * fade, glow=sec, title=True)
+        self._blit_text(house.label.upper(), int(150 * u), sec, self.fx, cy + 448 * u,
+                        ramp(t, 0.5, 0.8) * fade, glow=prim, title=True)
         tagline = "  ·  ".join(x for x in (house.animal, house.motto) if x)
         if tagline:
-            self._blit_text(tagline, int(46 * u), DIM, self.fx, cy + 395 * u, ramp(t, 1.4, 1.0) * fade * 0.8)
+            self._blit_text(tagline, int(52 * u), DIM, self.fx, cy + 590 * u, ramp(t, 1.4, 1.0) * fade * 0.8)
 
     # ------------------------------------------------------------------ drawing helpers
 
@@ -409,13 +446,13 @@ class MirrorDisplay:
         self.canvas.blit(halo, (self.fx - radius, y - radius))
 
     def _blit_text(self, text: str, size: int, color: Color, cx: float, cy: float, alpha: float,
-                   glow: Color | None = None) -> None:
+                   glow: Color | None = None, title: bool = False) -> None:
         if alpha <= 0.01 or not text:
             return
-        key = (text, size, color, glow)
+        key = (text, size, color, glow, title)
         surf = self._text_cache.get(key)
         if surf is None:
-            surf = self._render_text(text, size, color, glow or color)
+            surf = self._render_text(text, size, color, glow or color, title)
             if len(self._text_cache) > 200:
                 self._text_cache.clear()
             self._text_cache[key] = surf
@@ -427,8 +464,8 @@ class MirrorDisplay:
         surf.set_alpha(int(255 * min(alpha, 1.0)))
         self.canvas.blit(surf, (cx - surf.get_width() / 2, cy - surf.get_height() / 2))
 
-    def _render_text(self, text: str, size: int, color: Color, glow: Color) -> pygame.Surface:
-        font = self.font(size)
+    def _render_text(self, text: str, size: int, color: Color, glow: Color, title: bool = False) -> pygame.Surface:
+        font = self.font(size, title)
         base = font.render(text, True, color)
         pad = max(4, size // 3)
         w, h = base.get_width() + 2 * pad, base.get_height() + 2 * pad
@@ -593,7 +630,7 @@ def main() -> None:
     hat = HatClient(cfg, enabled=not args.no_hat)
     if args.no_hat:
         hat.cfg.fallback_audio = False
-    show = ShowController(cfg, hat, display.post)
+    show = ShowController(cfg, hat, display.post, display.set_caption)
     on_key = key_handler(people, cfg, lambda p: show.trigger(p, "keyboard", preempt=True), show.stop)
     display.status_line = lambda: f"hat={'on' if hat.online else 'off' if hat.online is False else '?'}"
     log.info("keys: 1-9/0 = person id, SPACE = random, F1-F4 = guest house, S = stop, ESC = quit")

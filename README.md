@@ -14,11 +14,12 @@ Phone: http://<pi>:8000/  ──▶ force any reveal (bypasses recognition)
 
 ```
 config.yaml              every tunable, commented with which way to move it
+dialogue.yaml            the hat's script: 8 openings, 5 suspense lines, 7 announcements per house
 people.json              name -> {id, house}; written by enroll.py (the sample entries are placeholders)
 mirror/
   main.py                the party app: display + recognition + override page, one process
   display.py             pygame mirror UI. Standalone = the "dumb" keyboard-driven show
-  show.py                sequence: thinking/mutter -> announcement -> reveal -> idle
+  show.py                sequence: thinking (dialogue) -> reveal -> idle
   hat.py                 ESP32 client + fallback audio through the Pi. CLI for testing
   server.py              override page backend;  override.html  the phone page
   recognize.py           recognition service. Standalone --preview for tuning
@@ -100,9 +101,11 @@ Record clips into `audio/source/`, any format ffmpeg reads:
 
 | File | Used for |
 |---|---|
-| `Alice.m4a` (a name from people.json) | Alice's announcement. Written out as `<her id>.wav/.env` |
-| `mutter1.wav`, `mutter2.wav`, … | thinking phase, picked at random. Make them at least `show.thinking_s` long |
-| `house_gryffindor.wav` (one per house) | guests from the override page, and the hat's physical button |
+| `Alice.m4a` (a name from people.json) | Alice's personal announcement. Written out as `<her id>.wav/.env`. Takes precedence over the dialogue script |
+| `mutter1.wav`, `mutter2.wav`, … | thinking phase for personal clips, picked at random |
+| `dlg_open_01.wav` … `dlg_hufflepuff_07.wav` | the dialogue script's lines, named by the ids in `dialogue.yaml` |
+| `dlg_open_01__alice.wav` | optional per-person variant of a personalized line; used for Alice instead of the generic `dlg_open_01.wav` |
+| `sfx_reveal.wav` | optional sting played as the crest appears |
 
 ```bash
 .venv/bin/python mirror/make_envelope.py audio/source/ --preview
@@ -110,7 +113,9 @@ Record clips into `audio/source/`, any format ffmpeg reads:
 
 Copy everything in `audio/sd/` to the root of a FAT32 microSD and power-cycle the hat. To add a person later: record, re-run, copy two files, power-cycle. No reflash.
 
-Set `show.reveal_delay_s` to when the house name is spoken in the clip (or set `reveal_delay_s` per person in people.json) so the crest lands on the word.
+Set `show.reveal_delay_s` to when the house name is spoken in a personal clip (or set `reveal_delay_s` per person in people.json) so the crest lands on the word. Dialogue clips don't need this: they're synced with `show.reveal_lead_s`.
+
+**Dialogue before voices:** with no `dlg_*.wav` generated yet, the show still runs the full sequence — opening, optional suspense, announcement — on the script's timings, with each line shown as a caption on the mirror (`show.captions: false` hides them). Generate the voices whenever, name the files by their ids, re-run `make_envelope.py`, and the same sequence switches to real audio automatically; the crest then lands `show.reveal_lead_s` before the clip ends, right on the shouted house name.
 
 **Test the chain:**
 
@@ -159,9 +164,11 @@ Runs `main.py` fullscreen, restarts on exit, logs to `logs/sortinghat.log`. A th
 
 ## How a sorting runs
 
-1. Recognition commits (or the phone/keyboard triggers): the mirror goes to **thinking** and the Pi sends `GET /mutter`.
-2. After `show.thinking_s`, `GET /play?id=N`. The ESP32 ACKs immediately. With no ACK within `hat.timeout_s` (1.5 s), the clip plays from `audio/sd/` through the Pi's audio output instead. The Pi 5 has no headphone jack, so that's HDMI audio or a USB speaker.
-3. After the clip's `reveal_delay_s`, the crest appears and holds for `show.reveal_s`, then the mirror returns to idle.
+1. Recognition commits (or the phone/keyboard triggers): the mirror goes to **thinking**, and the show draws a script from `dialogue.yaml` — a random opening (never the same one twice in a row) personalized with the guest's name from people.json, then a suspense line on ~25% of sortings (`show.suspense_prob`), then an announcement from their house's pool. The pool only reshuffles once all 7 lines of that house have been used. A guest's house always comes from people.json — recognition only picks the name, and a re-sort keeps the same house. Guests sorted without a name (keyboard F1–F4, generic button) get the generic opening/suspense lines. Unrecognized faces are not guessed at: recognition stays quiet and the operator triggers the right person from the phone.
+2. Each line plays as `GET /play?id=<clip id>`. With no ACK within `hat.timeout_s` (1.5 s), the clip plays from `audio/sd/` through the Pi's audio output instead. The Pi 5 has no headphone jack, so that's HDMI audio or a USB speaker. Lines without a clip yet hold for the script's caption timing.
+3. `show.reveal_lead_s` before the announcement clip ends — as the house name is shouted — the crest appears, optionally followed by `sfx_reveal`, and holds for `show.reveal_s`.
+
+People with a personal clip (`audio/sd/<id>.wav`) keep the classic single-clip flow: mutter, announcement, crest at `reveal_delay_s`.
 
 Recognition triggers are refused while a sorting is running. Phone and keyboard triggers preempt it, so if recognition picks the wrong person you just tap the right one.
 
