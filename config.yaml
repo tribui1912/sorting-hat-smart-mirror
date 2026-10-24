@@ -1,0 +1,132 @@
+# Sorting Hat + Smart Mirror: every tunable lives here.
+# Paths are relative to this file's directory.
+#
+# Tuning convention used in comments:
+#   (+) = what raising the value does, (-) = what lowering it does.
+
+paths:
+  people: people.json              # name -> {id, house}; written by enroll.py
+  embeddings: data/embeddings.npz  # ArcFace vectors; written by enroll.py
+  enroll_images: data/enroll       # raw enrollment frames, kept so you can re-embed later
+  audio: audio/sd                  # the exact files on the hat's SD card; also used for mirror fallback audio
+  assets: assets                   # optional crests/<house>.png and fonts
+  logs: logs
+
+# ---------------------------------------------------------------------------
+camera:
+  size: [1536, 864]       # capture size fed to the detector. 16:9 matches the Cam3 binned mode.
+                          # (+) better small/far faces, more CPU. (-) faster, faces get fewer pixels.
+  rotate: 0               # 0/90/180/270, applied in software before detection. Faces must be upright.
+  hflip: false            # hardware flip; only matters if the camera is mounted mirrored
+  vflip: false
+  lens_position: 0.8      # manual focus in dioptres (1 / metres). 0.8 = 1.25m, the standing spot.
+                          # null = continuous autofocus (can hunt when people walk past; manual is steadier).
+  webcam_index: 0         # dev-only: OpenCV webcam used when picamera2 isn't available (e.g. on a laptop)
+
+# ---------------------------------------------------------------------------
+recognition:
+  enabled: true           # master switch; also toggled live from the override page
+  model: buffalo_l        # buffalo_l = ResNet50 ArcFace (accurate). buffalo_s = MobileFaceNet (faster, weaker).
+                          # Switching model invalidates embeddings: run `enroll.py rebuild` afterwards.
+  det_size: [320, 320]    # detector input. (+) finds smaller faces, slower. 320 is plenty at 1-1.5m.
+  det_threshold: 0.6      # detector confidence. (+) fewer false faces (posters, costumes). (-) catches dim faces.
+
+  # Gate: when a face is good enough to bother embedding
+  min_face_px: 90         # min face box height in pixels. (+) only people at the spot. (-) recognises from further away.
+  max_yaw: 0.5            # nose offset from eye midpoint / eye distance. ~0 frontal, ~0.5 strong turn.
+                          # (-) stricter frontal requirement. Keep loose: the camera is already off-axis.
+  stable_frames: 3        # frames a face must hold still before embedding. (+) fewer walk-by triggers, slower.
+  stable_iou: 0.6         # box overlap counted as "still". (+) stricter stillness.
+  only_largest: true      # only embed the biggest face (the person on the spot). Saves CPU in a crowd.
+
+  # Matching
+  threshold: 0.42         # cosine similarity to accept a match. Set by calibrate.py.
+                          # (+) fewer strangers/wrong people accepted, more "no match". (-) the opposite.
+  margin: 0.08            # top1 - top2 required. Guards against sorting Alice as her sibling.
+                          # (+) safer between similar-looking friends, more "no match".
+  match_mode: centroid    # centroid = vs each person's averaged vector (robust, recommended).
+                          # max = vs best single enrollment shot (handles pose variety, higher stranger FAR).
+
+  # Voting
+  vote_window: 7          # frames considered per decision.
+  vote_min: 5             # frames in the window that must agree. (+) fewer misfires, slower to commit.
+  unknown_retry_s: 3.0    # after an UNKNOWN verdict, wait this long before re-voting the same face.
+  cooldown_s: 30          # per person: seconds after a sorting before they can be sorted again.
+  unknown_action: ignore  # ignore | random_house. random_house sorts strangers into a random house
+                          # using the generic house_<name> clips. Risky if a friend reads as UNKNOWN.
+
+  track_max_misses: 5     # frames a face can vanish before its track is dropped
+  target_far: 0.01        # calibrate.py: acceptable chance a stranger trips a match, per encounter
+
+# ---------------------------------------------------------------------------
+enroll:
+  shots: 8                    # target captures per person (5-10, vary pose/expression a little)
+  warn_shot_sim: 0.50         # warn if a single shot is less similar than this to the person's centroid
+  warn_mean_sim: 0.65         # warn if a person's average shot-to-centroid similarity is below this (bad capture)
+  warn_cross_sim: 0.45        # warn if two people's centroids are more similar than this (lookalikes)
+
+# ---------------------------------------------------------------------------
+display:
+  fullscreen: true
+  window_size: [540, 960]     # used when not fullscreen (portrait)
+  rotate: 0                   # software rotation 0/90/180/270. Prefer rotating in the OS screen settings.
+  focus_y: 0.22               # vertical position of the camera, as a fraction of screen height from the top.
+                              # All the animation clusters here so people look at the lens.
+  fps: 30
+  font: null                  # path to a .ttf/.otf (relative to paths.assets ok). null = system serif.
+  idle_text: "Approach the Hat..."
+  idle_text_every_s: 25       # how often the idle hint fades in. 0 = never.
+  thinking_phrases:
+    - "Hmm..."
+    - "Let me see..."
+    - "Interesting... very interesting..."
+    - "Where shall I put you?"
+    - "I see a great deal in here..."
+
+# ---------------------------------------------------------------------------
+show:
+  thinking_s: 4.0         # how long the hat mutters before announcing
+  reveal_delay_s: 2.0     # seconds into the announcement clip before the crest appears.
+                          # Set it to when the house name is spoken. Per-person override in people.json.
+  reveal_s: 10.0          # how long the reveal holds on the mirror
+
+# ---------------------------------------------------------------------------
+hat:
+  host: sortinghat.local  # use the ESP32's IP (DHCP reservation) for reliability; mDNS lookups can be slow
+  port: 80
+  timeout_s: 1.5          # no ACK in this long -> play the clip from the mirror instead
+  fallback_audio: true    # play through the Pi's own audio output if the hat doesn't answer
+  audio_device: null      # aplay -D device for fallback, e.g. "hw:0,0" or "default". null = system default.
+  ping_every_s: 5         # background health check shown on the override page
+
+# ---------------------------------------------------------------------------
+server:
+  host: 0.0.0.0
+  port: 8000              # override page: http://<pi>.local:8000/
+  token: ""               # optional shared secret; if set, open http://<pi>:8000/?token=<it>
+
+# ---------------------------------------------------------------------------
+envelope:                 # make_envelope.py
+  sample_rate: 22050      # output WAV rate for the ESP32 (16-bit mono)
+  normalize_dbfs: -1.0    # peak-normalise clips so all voices are equally loud. null = leave as is.
+  frame_ms: 20            # one jaw position per frame (50 Hz = the servo's native update rate)
+  smooth_frames: 3        # rolling average. (+) smoother, lazier jaw. (-) chattery jaw.
+  noise_floor: 0.10       # fraction of typical speech level below which the jaw shuts.
+                          # (+) jaw closes more between words. (-) jaw hangs open on breaths/reverb.
+  speech_travel: 0.65     # fraction of jaw travel used by normal speech; the rest is reserved for peaks.
+  gamma: 0.8              # <1 opens the jaw more on quiet syllables, >1 only on loud ones
+  lead_ms: 40             # jaw moves this much before the sound. Mouths open before sound comes out.
+  closed_deg: 90          # servo angle with the jaw shut   } must sit inside the firmware's
+  open_deg: 130           # servo angle with the jaw fully open } JAW_MIN_DEG..JAW_MAX_DEG
+                          # find both with: python mirror/hat.py jaw <deg>
+
+# ---------------------------------------------------------------------------
+# Crest art: put assets/crests/<house>.png (transparent background) to use the real crests;
+# without one, a shield in the house colours is drawn. The display logs which one each house uses.
+# Colours: film palette. Hufflepuff's black and Ravenclaw's bronze (books) would be invisible or muddy
+# behind the mirror, so their secondaries are lightened. Ravenclaw: swap secondary to "#cd7f32" for book bronze.
+houses:
+  gryffindor: {label: Gryffindor, primary: "#ae0001", secondary: "#eeba30", animal: Lion,   motto: "Courage"}
+  hufflepuff: {label: Hufflepuff, primary: "#ecb939", secondary: "#e8dcb8", animal: Badger, motto: "Loyalty"}
+  ravenclaw:  {label: Ravenclaw,  primary: "#2a4a9c", secondary: "#c0c4cc", animal: Eagle,  motto: "Wisdom"}
+  slytherin:  {label: Slytherin,  primary: "#1a7a3e", secondary: "#aaaaaa", animal: Serpent, motto: "Ambition"}

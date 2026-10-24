@@ -1,0 +1,21 @@
+# systemd *user* service: starts the mirror with the desktop session and restarts it if it ever exits.
+#   mkdir -p ~/.config/systemd/user && cp deploy/sortinghat.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now sortinghat
+#   journalctl --user -u sortinghat -f      # logs (also in logs/sortinghat.log)
+# Paths assume the project lives at ~/sorting-hat-smart-mirror; edit if not.
+[Unit]
+Description=Sorting Hat smart mirror
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+WorkingDirectory=%h/sorting-hat-smart-mirror
+ExecStart=%h/sorting-hat-smart-mirror/.venv/bin/python mirror/main.py
+Restart=always
+RestartSec=3
+# Wayland (labwc/wayfire on Bookworm). SDL falls back to X11 via XWayland if needed.
+Environment=SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS=0
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target

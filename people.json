@@ -1,0 +1,7 @@
+{
+  "Harry": {"id": 1, "house": "gryffindor"},
+  "Hermione": {"id": 2, "house": "gryffindor"},
+  "Luna": {"id": 3, "house": "ravenclaw"},
+  "Cedric": {"id": 4, "house": "hufflepuff"},
+  "Draco": {"id": 5, "house": "slytherin", "reveal_delay_s": 1.5}
+}

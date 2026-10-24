@@ -1,0 +1,9 @@
+# Pi: create the venv with --system-site-packages so apt's python3-picamera2 is visible.
+# picamera2 / libcamera come from apt, not pip.
+numpy
+pyyaml
+pygame>=2.1
+scipy                     # resampling in make_envelope.py (falls back to numpy if missing)
+onnxruntime               # CPU build; aarch64 wheels exist for the Pi 5
+insightface==0.7.3        # builds a small Cython extension on the Pi: needs build-essential + python3-dev
+opencv-python-headless    # image io for enroll/calibrate (insightface needs it too)
