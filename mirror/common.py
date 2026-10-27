@@ -85,6 +85,7 @@ class DisplayCfg:
     focus_y: float = 0.22
     fps: int = 30
     font: str | None = None
+    title_font: str | None = None  # display face for headings (name, house); falls back to font
     idle_text: str = "Approach the Hat..."
     idle_text_every_s: float = 25.0
     thinking_phrases: list[str] = field(default_factory=lambda: ["Hmm...", "Let me see..."])
@@ -95,6 +96,10 @@ class ShowCfg:
     thinking_s: float = 4.0
     reveal_delay_s: float = 2.0
     reveal_s: float = 10.0
+    dialogue: str = "dialogue.yaml"  # the hat's line collection; missing file = one clip per person/house
+    suspense_prob: float = 0.25  # share of sortings that get a suspense line before the verdict
+    reveal_lead_s: float = 1.2  # dialogue: crest appears this long before the clip ends (the name is shouted)
+    captions: bool = True  # show the hat's lines as mirror text while it speaks
 
 
 @dataclass

@@ -1,0 +1,87 @@
+# The Sorting Hat - Personalized Party Dialogue
+#
+# Flow per sorting: opening (3-5 s) -> optional suspense line -> house announcement.
+# Opening and suspense lines contain {name}, filled in with the recognized guest's
+# name; guests sorted without a name (keyboard F1-F4, generic button) use the
+# *_generic lines instead. House announcements are shared and drawn from a shuffled
+# pool that only resets once every line for that house has been used. A guest's
+# house always comes from people.json - it is never re-rolled.
+#
+# Each line's id is the clip name the hat plays: put the generated voice at
+# audio/source/<id>.wav (or .mp3/...) and run `python mirror/make_envelope.py audio/source/`
+# to produce audio/sd/<id>.wav + <id>.env for the SD card. Personalized lines first
+# look for a per-person variant named <id>__<name>.wav (e.g. dlg_open_01__alice.wav)
+# and fall back to the generic <id>.wav - so voices can be per-guest or shared.
+# Until a clip exists the show still runs, on the script's timings with the line
+# shown as a caption (set show.captions: false to hide them once voices are in).
+#
+# sfx_reveal.wav in audio/source/ (not listed here) is the optional sting played
+# on the mirror as the crest appears.
+
+opening:            # 8 variations - personalized with {name}
+  - {id: dlg_open_01, text: "Hmmmm... {name}, is it? Very interesting. Let's see what secrets you're hiding..."}
+  - {id: dlg_open_02, text: "Well, well, well... {name}! I've been expecting you. Let's see what sort of wizard you really are."}
+  - {id: dlg_open_03, text: "Ahhh, {name}... courage, ambition, wisdom, loyalty... I see a little of everything in you. But which is strongest?"}
+  - {id: dlg_open_04, text: "Oh dear, {name}... there's quite a lot happening inside that head of yours. Do try to keep your thoughts organized!"}
+  - {id: dlg_open_05, text: "Another student! Ah, {name}... let's see where destiny takes you. And do hurry, I've been working all evening!"}
+  - {id: dlg_open_06, text: "Hmm... {name}... an unusual mind. Very unusual. I haven't encountered one quite like yours in years."}
+  - {id: dlg_open_07, text: "Don't be nervous, {name}! I've been sorting witches and wizards for centuries. I only get it wrong occasionally."}
+  - {id: dlg_open_08, text: "Ah, yes... {name}. I see your strengths, your weaknesses, and... oh my! Let's pretend I didn't see that last thought."}
+
+suspense:           # 5 optional lines - ~25% of sortings, personalized with {name}
+  - {id: dlg_susp_01, text: "Hmmmm... {name}, two houses would suit you equally well. How delightfully inconvenient..."}
+  - {id: dlg_susp_02, text: "Wait... wait... what's this, {name}? Oh! I certainly wasn't expecting to find THAT inside your head!"}
+  - {id: dlg_susp_03, text: "Ah, I've got it, {name}! No, wait. That's not right... Oh, do be patient! I'm a hat, not a miracle worker!"}
+  - {id: dlg_susp_04, text: "Interesting... very interesting, {name}. There is more to you than meets the eye. Much more..."}
+  - {id: dlg_susp_05, text: "The decision has been made, {name}... your destiny is calling... and I know exactly where you belong!"}
+
+opening_generic:    # fallback when a nameless guest is sorted
+  - {id: dlg_open_01, text: "Hmmmm... now this is interesting. Very interesting indeed. Let's see what secrets you're hiding..."}
+  - {id: dlg_open_02, text: "Well, well, well... another mind to examine! Oh, I do hope you're more interesting than the last one."}
+  - {id: dlg_open_03, text: "Ahhh... courage, ambition, wisdom, loyalty... I see a little of everything in here. But which is strongest?"}
+  - {id: dlg_open_04, text: "Oh dear... there's quite a lot happening inside this head. Do try to keep your thoughts organized!"}
+  - {id: dlg_open_05, text: "Another student! Another destiny! And another reason I should have retired a hundred years ago..."}
+  - {id: dlg_open_06, text: "Hmm... an unusual mind. Very unusual. I haven't encountered one quite like yours in years."}
+  - {id: dlg_open_07, text: "Don't be nervous! I've been sorting witches and wizards for centuries. I only get it wrong occasionally."}
+  - {id: dlg_open_08, text: "Ah, yes... I see your strengths, your weaknesses, and... oh my! Let's pretend I didn't see that last thought."}
+
+suspense_generic:   # fallback when a nameless guest is sorted
+  - {id: dlg_susp_01, text: "Hmmmm... two houses would suit you equally well. How delightfully inconvenient..."}
+  - {id: dlg_susp_02, text: "Wait... wait... what's this? Oh! I certainly wasn't expecting to find THAT inside your head!"}
+  - {id: dlg_susp_03, text: "Ah, I've got it! No, wait. That's not right... or is it? Oh, do be patient! I'm a hat, not a miracle worker!"}
+  - {id: dlg_susp_04, text: "Interesting... very interesting. There is more to you than meets the eye. Much more..."}
+  - {id: dlg_susp_05, text: "The decision has been made... your destiny is calling... and I know exactly where you belong!"}
+
+houses:             # 7 announcements per house; each ends with the house name
+  gryffindor:
+    - {id: dlg_gryffindor_01, text: "Ahhh! A heart full of courage! A spirit that refuses to back down! There's only one place for you... GRYFFINDOR!"}
+    - {id: dlg_gryffindor_02, text: "Bold, determined, and always ready to stand up for what's right. The lion's spirit burns brightly within you. GRYFFINDOR!"}
+    - {id: dlg_gryffindor_03, text: "When others run from danger, you stand your ground. Fear may visit you, but it will never control you. GRYFFINDOR!"}
+    - {id: dlg_gryffindor_04, text: "Oh, you're brave! Very brave! Unfortunately, your common sense seems to have taken the day off. Definitely GRYFFINDOR!"}
+    - {id: dlg_gryffindor_05, text: "You'd charge into a dragon's cave without a plan, wouldn't you? Good heavens... another one! GRYFFINDOR!"}
+    - {id: dlg_gryffindor_06, text: "I see danger in your future... impossible challenges... and a courage that will shake the very walls of Hogwarts! GRYFFINDOR!"}
+    - {id: dlg_gryffindor_07, text: "There's a fire inside you that refuses to be extinguished. Whatever obstacles you face, you'll find the strength to overcome them. GRYFFINDOR!"}
+  slytherin:
+    - {id: dlg_slytherin_01, text: "Ahhh... ambition! Determination! A mind always three steps ahead. Oh, I know exactly where you belong. SLYTHERIN!"}
+    - {id: dlg_slytherin_02, text: "You understand that greatness is not simply given. It must be earned, pursued, and sometimes taken. SLYTHERIN!"}
+    - {id: dlg_slytherin_03, text: "A sharp mind, a stronger will, and the instincts of a serpent. Your path to greatness begins in SLYTHERIN!"}
+    - {id: dlg_slytherin_04, text: "Oh, you've already planned how to take over Hogwarts, haven't you? How wonderfully concerning. SLYTHERIN!"}
+    - {id: dlg_slytherin_05, text: "Clever, charming, and just a little suspicious. Remind me never to play cards against you. SLYTHERIN!"}
+    - {id: dlg_slytherin_06, text: "Power does not frighten you. Greatness does not escape you. And destiny? You intend to command it! SLYTHERIN!"}
+    - {id: dlg_slytherin_07, text: "You see possibilities where others see obstacles. You know what you want, and you possess the determination to achieve it. SLYTHERIN!"}
+  ravenclaw:
+    - {id: dlg_ravenclaw_01, text: "Ohhh... what a fascinating mind! So many questions, so many possibilities! A brilliant future awaits you in RAVENCLAW!"}
+    - {id: dlg_ravenclaw_02, text: "You seek knowledge not simply for its power, but for the wonder of discovery. A true scholar at heart. RAVENCLAW!"}
+    - {id: dlg_ravenclaw_03, text: "An inventive mind, a restless imagination, and a love for mysteries. Your place is surely in RAVENCLAW!"}
+    - {id: dlg_ravenclaw_04, text: "You question absolutely everything! Including my methods, apparently. How delightfully irritating. RAVENCLAW!"}
+    - {id: dlg_ravenclaw_05, text: "You'd stop in the middle of a dragon attack just to ask how dragon fire works. Fascinating... and completely ridiculous. RAVENCLAW!"}
+    - {id: dlg_ravenclaw_06, text: "I see visions of discovery... secrets waiting to be uncovered... and ideas that may change the magical world forever! RAVENCLAW!"}
+    - {id: dlg_ravenclaw_07, text: "Your greatest gift is your ability to see the world differently. Never stop questioning, imagining, and discovering. RAVENCLAW!"}
+  hufflepuff:
+    - {id: dlg_hufflepuff_01, text: "Ahhh... a kind heart, a loyal spirit, and a soul as warm as sunshine. There can be no doubt. HUFFLEPUFF!"}
+    - {id: dlg_hufflepuff_02, text: "You value friendship over glory, fairness over power, and kindness above all else. A true HUFFLEPUFF!"}
+    - {id: dlg_hufflepuff_03, text: "Patience, determination, and unwavering loyalty. Never underestimate the strength of a gentle heart. HUFFLEPUFF!"}
+    - {id: dlg_hufflepuff_04, text: "Oh, what a lovely mind! You're even thinking about sharing your snacks with everyone. HUFFLEPUFF!"}
+    - {id: dlg_hufflepuff_05, text: "You'd apologize to a spider before carrying it outside, wouldn't you? Oh, you're definitely a HUFFLEPUFF!"}
+    - {id: dlg_hufflepuff_06, text: "In a world filled with darkness, some souls shine with extraordinary warmth. Your kindness will become your greatest magic! HUFFLEPUFF!"}
+    - {id: dlg_hufflepuff_07, text: "You may not seek the spotlight, but the people around you know your worth. Your loyalty and compassion make you extraordinary. HUFFLEPUFF!"}

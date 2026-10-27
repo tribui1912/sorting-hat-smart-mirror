@@ -73,7 +73,8 @@ display:
   focus_y: 0.22               # vertical position of the camera, as a fraction of screen height from the top.
                               # All the animation clusters here so people look at the lens.
   fps: 30
-  font: null                  # path to a .ttf/.otf (relative to paths.assets ok). null = system serif.
+  font: fonts/Cinzel.ttf     # body: taglines, thinking phrases. null = system serif.
+  title_font: fonts/HarryP.ttf  # display face for the name + house name (movie-logo look). null = font.
   idle_text: "Approach the Hat..."
   idle_text_every_s: 25       # how often the idle hint fades in. 0 = never.
   thinking_phrases:
@@ -85,9 +86,16 @@ display:
 
 # ---------------------------------------------------------------------------
 show:
-  thinking_s: 4.0         # how long the hat mutters before announcing
-  reveal_delay_s: 2.0     # seconds into the announcement clip before the crest appears.
-                          # Set it to when the house name is spoken. Per-person override in people.json.
+  dialogue: dialogue.yaml # the hat's script: openings, suspense, 7 announcements per house.
+                          # Missing file = the classic one-clip-per-person flow.
+  suspense_prob: 0.25     # share of sortings that get a suspense line before the verdict
+  reveal_lead_s: 1.2      # dialogue mode: the crest appears this long before the announcement
+                          # clip ends - i.e. as the house name is shouted.
+  captions: true          # show the hat's lines as mirror text. Turn off once the voice clips
+                          # exist (or keep them as subtitles).
+  thinking_s: 4.0         # single-clip mode only: how long the hat mutters before the announcement
+  reveal_delay_s: 2.0     # single-clip mode only: seconds into the clip before the crest appears.
+                          # Per-person override in people.json.
   reveal_s: 10.0          # how long the reveal holds on the mirror
 
 # ---------------------------------------------------------------------------
@@ -125,8 +133,9 @@ envelope:                 # make_envelope.py
 # without one, a shield in the house colours is drawn. The display logs which one each house uses.
 # Colours: film palette. Hufflepuff's black and Ravenclaw's bronze (books) would be invisible or muddy
 # behind the mirror, so their secondaries are lightened. Ravenclaw: swap secondary to "#cd7f32" for book bronze.
+# motto = the tagline under the house name. Set animal: Lion etc. to prefix the animal name.
 houses:
-  gryffindor: {label: Gryffindor, primary: "#ae0001", secondary: "#eeba30", animal: Lion,   motto: "Courage"}
-  hufflepuff: {label: Hufflepuff, primary: "#ecb939", secondary: "#e8dcb8", animal: Badger, motto: "Loyalty"}
-  ravenclaw:  {label: Ravenclaw,  primary: "#2a4a9c", secondary: "#c0c4cc", animal: Eagle,  motto: "Wisdom"}
-  slytherin:  {label: Slytherin,  primary: "#1a7a3e", secondary: "#aaaaaa", animal: Serpent, motto: "Ambition"}
+  gryffindor: {label: Gryffindor, primary: "#ae0001", secondary: "#eeba30", motto: "Where dwell the brave at heart"}
+  hufflepuff: {label: Hufflepuff, primary: "#ecb939", secondary: "#e8dcb8", motto: "Patient and true, unafraid of toil"}
+  ravenclaw:  {label: Ravenclaw,  primary: "#2a4a9c", secondary: "#c0c4cc", motto: "Wit beyond measure is man's greatest treasure"}
+  slytherin:  {label: Slytherin,  primary: "#1a7a3e", secondary: "#aaaaaa", motto: "Any means to achieve their ends"}

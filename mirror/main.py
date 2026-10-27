@@ -39,7 +39,7 @@ def main() -> int:
 
     display = MirrorDisplay(cfg, windowed=args.windowed)
     hat = HatClient(cfg)
-    show = ShowController(cfg, hat, display.post)
+    show = ShowController(cfg, hat, display.post, display.set_caption)
 
     recognizer = None
     if not args.no_recognition:
