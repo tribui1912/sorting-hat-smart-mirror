@@ -1,508 +1,253 @@
-// Sorting Hat: audio + jaw on one ESP32.
-//
-// SD card root:
-//   <id>.wav / <id>.env          per-person announcement (id = number from people.json)
-//   house_<house>.wav / .env     generic announcements (guests, physical button)
-//   mutter*.wav / .env           "thinking" clips, one picked at random
-// WAVs are 16-bit mono 22050 Hz, envelopes one servo angle byte per 20 ms (make_envelope.py).
-// Adding a person = copy two files + power-cycle. No reflash.
-//
-// HTTP:  /play?id=N   /mutter   /stop   /status   /jaw?deg=N (servo calibration)
-//
-// Threading: the web server runs in loop(); a higher-priority audio task owns the SD card, the
-// I2S output and the servo. They talk through a FreeRTOS queue, so a slow HTTP client can't
-// starve the audio, and audio + jaw are driven from one place off one sample position.
-//
-// Libraries: ESP8266Audio (Earle Philhower), ESP32Servo (Kevin Harrington). See README.
+/*
+ * Sorting Hat — WiFi VOICE STREAMER (XIAO ESP32-C5)
+ * -----------------------------------------------------------------
+ * Joins WiFi (secrets.h) and listens on TCP 5005. The Jetson/PC side
+ * (jetson/send_audio.py) streams 16-bit mono 22050 Hz PCM; the hat
+ * plays it through the MAX98357A while the mouth motor flaps with the
+ * voice loudness.
+ *
+ * Protocol (commands are newline-terminated ASCII):
+ *   PING                              -> PONG reset=<why last boot> up=<s> boots=<n>
+ *                                        (reset=BROWNOUT => the 5V rail is sagging)
+ *   CLIP                              -> plays the embedded bench clip, then DONE
+ *   PLAY <n>  followed by n PCM bytes -> OK, streams to speaker, then DONE
+ * A client that disconnects mid-PLAY aborts playback cleanly.
+ *
+ * WiFi: copy secrets.h.example -> secrets.h and fill in. The IP is
+ * printed on the Serial Monitor when it joins — pass it to
+ * send_audio.py --host.
+ *
+ * Pins: I2S BCLK=D3 LRC=D4 DIN=D5 ; motor SIG=D6 ; button=D7.
+ * Board: XIAO_ESP32C5, USB CDC On Boot enabled.
+ * -----------------------------------------------------------------
+ */
 
-#include <Arduino.h>
-#include <ESPmDNS.h>
-#include <ESP32Servo.h>
-#include <SD.h>
-#include <SPI.h>
-#include <WebServer.h>
+#include <ESP_I2S.h>
 #include <WiFi.h>
+#include <esp_system.h>
+#include "secrets.h"          // WIFI_SSID / WIFI_PASSWORD
+#include "audio/test_line.h"  // bench clip (CLIP command / D7 button)
 
-#include <vector>
+const int I2S_BCLK = D3, I2S_LRC = D4, I2S_DOUT = D5;
+const int PIN_MOTOR = D6, PIN_BTN = D7;
+const int PIN_LED = LED_BUILTIN;
+const int LED_ON = LOW, LED_OFF = HIGH;
 
-#include "AudioFileSourceSD.h"
-#include "AudioGeneratorWAV.h"
-#include "AudioOutputI2S.h"
-#include "config.h"
+const uint32_t SAMPLE_RATE = 22050;  // must match send_audio.py conversion
+const int PWM_FREQ = 20000, PWM_RES = 8;
+const uint16_t TCP_PORT = 5005;
 
-#if __has_include("secrets.h")
-#include "secrets.h"
-#else
-#error "Copy secrets.h.example to secrets.h and set your Wi-Fi credentials"
-#endif
+const int MOTOR_DUTY = 240;        // 240 ≈ 4.2V — proven OEM value; 215 stalls under load
+// Each flap starts the motor from rest, pulling near-stall current off the shared
+// 5V rail. A short hardware fade 0 -> MOTOR_DUTY softens that spike so the ESP32
+// doesn't brown out. 0 = hard switch-on (old behaviour). Keep < MOUTH_HOLD * 12 ms.
+const int MOTOR_RAMP_MS = 15;
+const float VOLUME = 1.0f;         // 1.0 = as recorded (full scale); 0.5 ≈ -6 dB; amp gain set by GAIN pin
+// Mouth follows the voice: motor ON while the clip is loud, OFF in pauses.
+const int   MOUTH_GATE  = 1200;   // loudness floor (of 32767) below which mouth stops
+const float MOUTH_RELAX = 0.70f;  // envelope release per chunk (~12 ms)
+const int   MOUTH_HOLD  = 3;      // minimum ON time in chunks (~35 ms) per flap
 
-// ======================================================================= shared state
+const size_t CH = 512;            // PCM bytes per chunk (~12 ms of audio)
 
-enum CmdType : uint8_t { CMD_PLAY, CMD_MUTTER, CMD_STOP, CMD_BUTTON, CMD_JAW };
-struct Cmd {
-  CmdType type;
-  char id[32];
-  int arg;
-};
+I2SClass I2S;
+WiFiServer server(TCP_PORT);
 
-// (types live up here: the Arduino IDE generates function prototypes above the first function)
-struct WavInfo {
-  uint32_t dataOffset = 44;
-  uint32_t sampleRate = 22050;
-  uint16_t blockAlign = 2;  // bytes per sample frame (all channels)
-};
-
-static QueueHandle_t cmdQueue;
-static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
-static char statusState[12] = "boot";  // idle | playing | muttering
-static char statusClip[32] = "";
-static uint32_t clipsPlayed = 0;
-
-// Catalogue of clips found on the card at boot (read-only afterwards).
-static std::vector<String> clipIds;
-static std::vector<String> mutterIds;
-static std::vector<String> houseIds;
-static bool sdOk = false;
-
-WebServer server(80);
-Servo jaw;
-
-static void setStatus(const char *state, const char *clip) {
-  portENTER_CRITICAL(&statusMux);
-  strlcpy(statusState, state, sizeof(statusState));
-  strlcpy(statusClip, clip, sizeof(statusClip));
-  portEXIT_CRITICAL(&statusMux);
-}
-
-static bool hasClip(const std::vector<String> &v, const String &id) {
-  for (const auto &s : v)
-    if (s == id) return true;
-  return false;
-}
-
-// ======================================================================= jaw
-
-static int lastAngle = -1;
-static uint32_t lastJawMoveMs = 0;
-
-static int clampAngle(int deg) {
-  const int lo = min(JAW_MIN_DEG, JAW_MAX_DEG), hi = max(JAW_MIN_DEG, JAW_MAX_DEG);
-  return constrain(deg, lo, hi);
-}
-
-static int travelToAngle(float frac) {
-  return (int)lroundf(JAW_CLOSED_DEG + frac * (JAW_OPEN_DEG - JAW_CLOSED_DEG));
-}
-
-static void setJaw(int deg) {
-  deg = clampAngle(deg);
-  if (!jaw.attached()) {
-    jaw.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
-    lastAngle = -1;
+// Why did we last boot? Off USB there's no Serial Monitor, so PING reports it.
+RTC_NOINIT_ATTR uint32_t bootCount;   // survives brownout/panic resets, not power-on
+const char* resetName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:  return "POWERON";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_PANIC:    return "PANIC";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:      return "WATCHDOG";
+    case ESP_RST_SW:       return "SOFTWARE";
+    case ESP_RST_EXT:      return "EXTERNAL";
+    default:               return "OTHER";
   }
-  if (deg != lastAngle) {
-    jaw.write(deg);
-    lastAngle = deg;
-  }
-  lastJawMoveMs = millis();
+}
+esp_reset_reason_t bootReason;
+
+// ---- shared playback path: mouth tracking + volume, used by CLIP and PLAY
+int16_t outBuf[CH / 2];
+static int16_t inS[CH / 2];       // network staging buffer (int16-aligned)
+float env = 0.0f;
+int onFor = 0;
+bool motorOn = false;
+uint32_t dbgT = 0;
+
+void mouthStart() { env = 0.0f; onFor = 0; motorOn = false; }
+void mouthStop()  { ledcWrite(PIN_MOTOR, 0); motorOn = false; }
+
+void setMotor(bool on) {
+  if (on == motorOn) return;           // only act on edges so the fade can finish
+  motorOn = on;
+  if (on && MOTOR_RAMP_MS > 0) ledcFade(PIN_MOTOR, 0, MOTOR_DUTY, MOTOR_RAMP_MS);
+  else ledcWrite(PIN_MOTOR, on ? MOTOR_DUTY : 0);
 }
 
-// ======================================================================= playback (audio task only)
-
-// Walk the RIFF chunks to find where samples start; don't assume a 44-byte header.
-static bool readWavInfo(const String &path, WavInfo &info) {
-  File f = SD.open(path);
-  if (!f) return false;
-  uint8_t hdr[12];
-  if (f.read(hdr, 12) != 12 || memcmp(hdr, "RIFF", 4) || memcmp(hdr + 8, "WAVE", 4)) {
-    f.close();
-    return false;
+void emitChunk(const int16_t* s, size_t samples) {
+  int32_t peak = 0;
+  for (size_t i = 0; i < samples; i++) {
+    int32_t o = s[i];
+    int32_t a = o < 0 ? -o : o;
+    if (a > peak) peak = a;            // envelope uses pre-volume level,
+    outBuf[i] = (int16_t)(o * VOLUME); // so MOUTH_GATE is volume-independent
   }
-  bool gotFmt = false, gotData = false;
-  while (f.available() >= 8) {
-    uint8_t ch[8];
-    if (f.read(ch, 8) != 8) break;
-    uint32_t sz = ch[4] | (ch[5] << 8) | (ch[6] << 16) | ((uint32_t)ch[7] << 24);
-    if (!memcmp(ch, "fmt ", 4) && sz >= 16) {
-      uint8_t fmt[16];
-      f.read(fmt, 16);
-      info.sampleRate = fmt[4] | (fmt[5] << 8) | (fmt[6] << 16) | ((uint32_t)fmt[7] << 24);
-      info.blockAlign = fmt[12] | (fmt[13] << 8);
-      f.seek(f.position() + sz - 16 + (sz & 1));
-      gotFmt = true;
-    } else if (!memcmp(ch, "data", 4)) {
-      info.dataOffset = f.position();
-      gotData = true;
-      break;
+  env = (float)peak > env ? (float)peak : env * MOUTH_RELAX;
+
+  // motor stalls below full duty, so drive it binary: loud = flap, pause = rest
+  if (env > MOUTH_GATE) onFor = MOUTH_HOLD;
+  else if (onFor > 0) onFor--;
+  setMotor(onFor > 0);
+
+  if (millis() - dbgT > 400) {         // ~2-3 debug lines/s while playing
+    dbgT = millis();
+    Serial.printf("env %5d  duty %d\n", (int)env, onFor > 0 ? MOTOR_DUTY : 0);
+  }
+  I2S.write((uint8_t*)outBuf, samples * 2);   // blocks via DMA = paces playback
+}
+
+void playClip() {                      // embedded bench clip
+  Serial.println("play embedded clip");
+  digitalWrite(PIN_LED, LED_ON);
+  mouthStart();
+  const size_t LEN = test_line_len * sizeof(test_line_pcm[0]);
+  for (size_t off = 0; off < LEN; off += CH)
+    emitChunk(test_line_pcm + off / 2, min(CH, LEN - off) / 2);
+  mouthStop();
+  digitalWrite(PIN_LED, LED_OFF);
+}
+
+// Stream `total` PCM bytes from the TCP client to the speaker.
+void playStream(WiFiClient& client, size_t total) {
+  Serial.printf("stream %u bytes (%.1f s)\n", (unsigned)total, total / (SAMPLE_RATE * 2.0));
+  digitalWrite(PIN_LED, LED_ON);
+  mouthStart();
+  size_t got = 0, fill = 0;
+  while (got < total && client.connected()) {
+    int r = client.read((uint8_t*)inS + fill, min(CH - fill, total - got));
+    if (r > 0) {
+      fill += r;
+      got += r;
+      if (fill == CH || got == total) {          // chunk full or stream ended
+        emitChunk(inS, fill / 2);
+        if (fill & 1) { inS[0] = (int16_t)((uint8_t*)inS)[fill - 1]; fill = 1; }
+        else fill = 0;
+      }
+    } else if (r < 0) break;                     // socket error -> abort
+    else delay(1);                               // no data yet
+  }
+  if (fill >= 2) emitChunk(inS, fill / 2);       // flush final partial chunk
+  mouthStop();
+  digitalWrite(PIN_LED, LED_OFF);
+  Serial.println("playback done");
+}
+
+String readLine(WiFiClient& c) {
+  String line;
+  uint32_t idle = millis();
+  while (millis() - idle < 3000) {               // 3 s idle timeout
+    while (c.available()) {
+      char ch = c.read();
+      if (ch == '\n') return line;
+      if (ch != '\r') line += ch;
+      idle = millis();
+    }
+    if (!c.connected()) break;
+    delay(1);
+  }
+  return line;
+}
+
+void handleClient(WiFiClient& client) {
+  while (client.connected()) {
+    String line = readLine(client);
+    if (line.length() == 0) return;              // timeout / dead link
+    if (line == "PING") {
+      client.printf("PONG reset=%s up=%lus boots=%lu\n", resetName(bootReason),
+                    millis() / 1000, (unsigned long)bootCount);
+    } else if (line == "CLIP") {
+      playClip();
+      client.print("DONE\n");
+    } else if (line.startsWith("PLAY ")) {
+      size_t total = strtoul(line.c_str() + 5, nullptr, 10);
+      if (total == 0 || total & 1) { client.print("ERR byte count must be even\n"); return; }
+      client.print("OK\n");                      // sender pushes the n bytes now
+      playStream(client, total);
+      client.print("DONE\n");
+      return;                                    // one PLAY per connection
     } else {
-      f.seek(f.position() + sz + (sz & 1));
+      client.print("ERR unknown command\n");
+      return;
     }
-  }
-  f.close();
-  return gotFmt && gotData && info.sampleRate > 0 && info.blockAlign > 0;
-}
-
-static const int WAV_READAHEAD_BYTES = 128;  // AudioGeneratorWAV's internal read buffer
-static AudioOutputI2S *out = nullptr;
-static AudioGeneratorWAV *wav = nullptr;
-static AudioFileSourceSD *src = nullptr;
-static WavInfo curInfo;
-static uint8_t env[MAX_ENV_FRAMES];
-static size_t envLen = 0;
-static uint32_t silentUntil = 0;       // silent procedural mutter (no clip on card)
-static uint32_t nextProceduralMs = 0;  // next random jaw target when there's no envelope
-static String pendingClip;             // played when the current clip ends (button sequence)
-
-static void stopClip() {
-  if (wav) {
-    if (wav->isRunning()) wav->stop();
-    delete wav;
-    wav = nullptr;
-  }
-  if (src) {
-    delete src;
-    src = nullptr;
-  }
-  envLen = 0;
-  silentUntil = 0;
-}
-
-static bool startClip(const String &id, bool isMutter) {
-  stopClip();
-  const String wavPath = "/" + id + ".wav";
-  if (!readWavInfo(wavPath, curInfo)) {
-    Serial.printf("[audio] %s missing or not a PCM WAV\n", wavPath.c_str());
-    setStatus("idle", "");
-    return false;
-  }
-  envLen = 0;
-  File e = SD.open("/" + id + ".env");
-  if (e) {
-    envLen = e.read(env, MAX_ENV_FRAMES);
-    e.close();
-  } else {
-    Serial.printf("[audio] no %s.env: using random jaw\n", id.c_str());
-  }
-  src = new AudioFileSourceSD(wavPath.c_str());
-  wav = new AudioGeneratorWAV();
-  if (!wav->begin(src, out)) {
-    Serial.printf("[audio] failed to start %s\n", wavPath.c_str());
-    stopClip();
-    setStatus("idle", "");
-    return false;
-  }
-  clipsPlayed++;
-  setStatus(isMutter ? "muttering" : "playing", id.c_str());
-  Serial.printf("[audio] playing %s (%lu Hz, %u env frames)\n", id.c_str(), (unsigned long)curInfo.sampleRate, (unsigned)envLen);
-  return true;
-}
-
-static void startMutter() {
-  if (!mutterIds.empty() && startClip(mutterIds[random(mutterIds.size())], true)) return;
-  stopClip();
-  silentUntil = millis() + SILENT_MUTTER_MS;
-  setStatus("muttering", "");
-}
-
-// Random jaw movement for clips without an envelope (and the silent mutter).
-static void proceduralJaw() {
-  if ((int32_t)(millis() - nextProceduralMs) < 0) return;
-  nextProceduralMs = millis() + random(70, 170);
-  setJaw(travelToAngle(random(0, 2) ? random(15, 55) / 100.0f : 0.0f));
-}
-
-// The heart of sync: jaw frame derived from the same sample position the audio is playing from.
-static void updateJawFromAudio() {
-  if (!envLen) {
-    proceduralJaw();
-    return;
-  }
-  const int64_t bytesRead = (int64_t)src->getPos() - curInfo.dataOffset;
-  // samples read from the file, minus what's still queued in the generator and the DMA buffers
-  const int64_t queued = DMA_BUFFERS * DMA_BUFFER_BYTES / 4 + WAV_READAHEAD_BYTES / curInfo.blockAlign +
-                         (int64_t)curInfo.sampleRate * AUDIO_SYNC_TRIM_MS / 1000;
-  const int64_t samples = bytesRead / curInfo.blockAlign - queued;
-  if (samples < 0) return;
-  size_t frame = (size_t)(samples * 1000 / ((int64_t)curInfo.sampleRate * ENV_FRAME_MS));
-  if (frame >= envLen) frame = envLen - 1;
-  setJaw(env[frame]);
-}
-
-// ======================================================================= idle behaviour
-
-static uint32_t nextTwitchMs = 0;
-static uint32_t twitchReturnMs = 0;
-
-static void idleTick() {
-  const uint32_t now = millis();
-  if (twitchReturnMs && (int32_t)(now - twitchReturnMs) >= 0) {
-    setJaw(JAW_CLOSED_DEG);
-    twitchReturnMs = 0;
-  }
-  if ((int32_t)(now - nextTwitchMs) >= 0) {
-    setJaw(travelToAngle(IDLE_TWITCH_TRAVEL * random(30, 101) / 100.0f));
-    twitchReturnMs = now + IDLE_TWITCH_HOLD_MS;
-    nextTwitchMs = now + random(IDLE_TWITCH_MIN_MS, IDLE_TWITCH_MAX_MS);
-  }
-  if (SERVO_DETACH_IDLE_MS > 0 && jaw.attached() && !twitchReturnMs && now - lastJawMoveMs > SERVO_DETACH_IDLE_MS) {
-    jaw.detach();
-  }
-}
-
-static void finishedClip() {
-  stopClip();
-  setJaw(JAW_CLOSED_DEG);
-  nextTwitchMs = millis() + random(IDLE_TWITCH_MIN_MS, IDLE_TWITCH_MAX_MS);
-  if (pendingClip.length()) {
-    String next = pendingClip;
-    pendingClip = "";
-    if (startClip(next, false)) return;
-  }
-  setStatus("idle", "");
-}
-
-static void handleCmd(const Cmd &c) {
-  switch (c.type) {
-    case CMD_PLAY:
-      pendingClip = "";
-      if (!startClip(String(c.id), false)) finishedClip();
-      break;
-    case CMD_MUTTER:
-      pendingClip = "";
-      startMutter();
-      break;
-    case CMD_STOP:
-      pendingClip = "";
-      finishedClip();
-      break;
-    case CMD_BUTTON:  // manual fallback: mutter, then a random house
-      if (houseIds.empty()) {
-        Serial.println("[button] no house_*.wav on the card");
-        startMutter();
-        break;
-      }
-      pendingClip = houseIds[random(houseIds.size())];
-      Serial.printf("[button] sorting a guest into %s\n", pendingClip.c_str());
-      startMutter();
-      break;
-    case CMD_JAW:
-      stopClip();
-      setStatus("idle", "");
-      setJaw(c.arg);
-      nextTwitchMs = millis() + 15000;  // hold still while you're calibrating
-      break;
-  }
-}
-
-static void audioTask(void *) {
-  for (;;) {
-    Cmd c;
-    const bool active = wav || silentUntil;
-    // Block on the queue when idle; when playing just peek so the DMA buffers keep filling.
-    if (xQueueReceive(cmdQueue, &c, active ? 0 : pdMS_TO_TICKS(10)) == pdTRUE) handleCmd(c);
-
-    if (wav) {
-      if (wav->isRunning() && wav->loop()) {
-        updateJawFromAudio();
-      } else {
-        finishedClip();  // starts pendingClip if the button queued one
-      }
-    } else if (silentUntil) {
-      if ((int32_t)(millis() - silentUntil) < 0) {
-        proceduralJaw();
-      } else {
-        silentUntil = 0;
-        finishedClip();
-      }
-    } else {
-      idleTick();
-    }
-    vTaskDelay(1);  // let loop() (web server) run; DMA buffers cover ~45 ms
-  }
-}
-
-// ======================================================================= web server (loop task)
-
-static bool enqueue(const Cmd &c) { return xQueueSend(cmdQueue, &c, 0) == pdTRUE; }
-
-static bool validId(const String &id) {
-  if (id.length() == 0 || id.length() >= sizeof(Cmd::id)) return false;
-  for (char ch : id)
-    if (!isalnum((unsigned char)ch) && ch != '_' && ch != '-') return false;
-  return true;
-}
-
-static void handlePlay() {
-  const String id = server.arg("id");
-  if (!validId(id)) return server.send(400, "text/plain", "bad id\n");
-  if (!hasClip(clipIds, id)) return server.send(404, "text/plain", "no /" + id + ".wav on SD\n");
-  Cmd c{CMD_PLAY, {0}, 0};
-  strlcpy(c.id, id.c_str(), sizeof(c.id));
-  if (!enqueue(c)) return server.send(503, "text/plain", "busy\n");
-  server.send(200, "text/plain", "OK " + id + "\n");
-}
-
-static void handleSimple(CmdType t) {
-  Cmd c{t, {0}, 0};
-  if (!enqueue(c)) return server.send(503, "text/plain", "busy\n");
-  server.send(200, "text/plain", "OK\n");
-}
-
-static void handleJaw() {
-  if (!server.hasArg("deg")) return server.send(400, "text/plain", "need ?deg=\n");
-  const int requested = server.arg("deg").toInt();
-  Cmd c{CMD_JAW, {0}, requested};
-  if (!enqueue(c)) return server.send(503, "text/plain", "busy\n");
-  server.send(200, "text/plain", "OK jaw " + String(clampAngle(requested)) +
-                                     (clampAngle(requested) != requested ? " (clamped by JAW_MIN/MAX_DEG)\n" : "\n"));
-}
-
-static String jsonList(const std::vector<String> &v) {
-  String s = "[";
-  for (size_t i = 0; i < v.size(); i++) s += (i ? ",\"" : "\"") + v[i] + "\"";
-  return s + "]";
-}
-
-static void handleStatus() {
-  char state[12], clip[32];
-  portENTER_CRITICAL(&statusMux);
-  strlcpy(state, statusState, sizeof(state));
-  strlcpy(clip, statusClip, sizeof(clip));
-  portEXIT_CRITICAL(&statusMux);
-  String j = "{";
-  j += "\"state\":\"" + String(state) + "\",";
-  j += "\"clip\":\"" + String(clip) + "\",";
-  j += "\"sd\":" + String(sdOk ? "true" : "false") + ",";
-  j += "\"clips\":" + jsonList(clipIds) + ",";
-  j += "\"mutters\":" + String(mutterIds.size()) + ",";
-  j += "\"houses\":" + jsonList(houseIds) + ",";
-  j += "\"played\":" + String(clipsPlayed) + ",";
-  j += "\"uptime_s\":" + String(millis() / 1000) + ",";
-  j += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-  j += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
-  j += "\"jaw\":{\"closed\":" + String(JAW_CLOSED_DEG) + ",\"open\":" + String(JAW_OPEN_DEG) +
-       ",\"min\":" + String(JAW_MIN_DEG) + ",\"max\":" + String(JAW_MAX_DEG) + "}";
-  j += "}";
-  server.send(200, "application/json", j);
-}
-
-// ======================================================================= setup / loop
-
-static void scanCard() {
-  File root = SD.open("/");
-  if (!root) return;
-  for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-    String name = f.name();
-    f.close();
-    if (name.startsWith("/")) name = name.substring(1);  // older cores return a leading slash
-    if (name.startsWith(".") || !name.endsWith(".wav")) continue;
-    const String id = name.substring(0, name.length() - 4);
-    if (!validId(id)) {
-      Serial.printf("[sd] skipping %s: ids may only use letters, digits, _ and -\n", name.c_str());
-      continue;
-    }
-    clipIds.push_back(id);
-    if (id.startsWith("mutter")) mutterIds.push_back(id);
-    if (id.startsWith("house_")) houseIds.push_back(id);
-  }
-  root.close();
-  Serial.printf("[sd] %u clips, %u mutters, %u house clips\n", clipIds.size(), mutterIds.size(), houseIds.size());
-}
-
-static bool mdnsStarted = false;
-
-static void connectWifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(HOSTNAME);
-#if USE_STATIC_IP
-  WiFi.config(IPAddress(STATIC_IP), IPAddress(STATIC_GATEWAY), IPAddress(STATIC_SUBNET), IPAddress(STATIC_GATEWAY));
-#endif
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  WiFi.setSleep(false);  // modem sleep adds 100+ ms latency: the Pi only waits 1.5 s for an ACK
-  Serial.printf("[wifi] connecting to %s", WIFI_SSID);
-  const uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(250);
-    Serial.print('.');
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[wifi] %s  http://%s.local/\n", WiFi.localIP().toString().c_str(), HOSTNAME);
-  } else {
-    Serial.println("[wifi] not connected yet; button still works, will keep retrying");
   }
 }
 
 void setup() {
+  // motor off FIRST: D6 floats through the MOSFET module's input until PWM
+  // attaches, which spins the motor on direct-5V power during boot
+  pinMode(PIN_MOTOR, OUTPUT);
+  digitalWrite(PIN_MOTOR, LOW);
+
   Serial.begin(115200);
-  delay(200);
-  Serial.println("\n== Sorting Hat ==");
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  randomSeed(esp_random());
+  delay(300);
+  Serial.println("\nSORTING HAT — wifi voice streamer (XIAO ESP32-C5)");
+  bootReason = esp_reset_reason();
+  if (bootReason == ESP_RST_POWERON) bootCount = 0;   // RTC_NOINIT is garbage after power-on
+  bootCount++;
+  Serial.printf("reset reason: %s (boot #%lu)\n", resetName(bootReason), (unsigned long)bootCount);
 
-  jaw.setPeriodHertz(50);
-  setJaw(JAW_CLOSED_DEG);
+  pinMode(PIN_LED, OUTPUT); digitalWrite(PIN_LED, LED_OFF);
+  pinMode(PIN_BTN, INPUT_PULLUP);
+  ledcAttach(PIN_MOTOR, PWM_FREQ, PWM_RES);
+  mouthStop();
 
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  sdOk = SD.begin(SD_CS, SPI, SD_SPI_HZ);
-  if (sdOk) {
-    scanCard();
-  } else {
-    Serial.println("[sd] MOUNT FAILED: check wiring/format (FAT32). Running with no clips.");
+  // Silence or wrong pitch? change MONO -> STEREO here.
+  I2S.setPins(I2S_BCLK, I2S_LRC, I2S_DOUT, -1, -1);
+  if (!I2S.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO))
+    Serial.println("I2S begin FAILED");
+
+  WiFi.mode(WIFI_STA);
+  // Lower TX power cuts the radio's ~300+ mA transmit spikes, which on a shared
+  // motor/amp 5V rail are enough to trip the brownout detector. 8.5 dBm is plenty
+  // for a router in the same room; raise it if RSSI is poor.
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  WiFi.setSleep(false);                          // no modem-sleep stalls mid-stream
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("joining wifi");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400); Serial.print(".");
+    if (millis() - t0 > 20000) ESP.restart();    // stuck association -> start clean
   }
-
-  out = new AudioOutputI2S();
-  out->SetBuffers(DMA_BUFFERS, DMA_BUFFER_BYTES);  // known depth, so the jaw sync can subtract it
-  out->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-  out->SetGain(VOLUME);
-
-  cmdQueue = xQueueCreate(4, sizeof(Cmd));
-  setStatus("idle", "");
-  // Same core as loop() but higher priority: audio preempts the web server, never the reverse.
-  xTaskCreatePinnedToCore(audioTask, "audio", 8192, nullptr, 3, nullptr, 1);
-
-  connectWifi();
-  server.on("/", [] {
-    server.send(200, "text/plain", "Sorting Hat. /play?id=N /mutter /stop /status /jaw?deg=N\n");
-  });
-  server.on("/play", handlePlay);
-  server.on("/mutter", [] { handleSimple(CMD_MUTTER); });
-  server.on("/stop", [] { handleSimple(CMD_STOP); });
-  server.on("/status", handleStatus);
-  server.on("/jaw", handleJaw);
-  server.onNotFound([] { server.send(404, "text/plain", "not found\n"); });
+  Serial.println();
+  Serial.print("HAT IP: "); Serial.println(WiFi.localIP());   // <- for send_audio.py
   server.begin();
-}
-
-static void pollButton() {
-  static bool lastRaw = HIGH, stable = HIGH;
-  static uint32_t changedMs = 0, lastFireMs = 0;
-  const bool raw = digitalRead(BUTTON_PIN);
-  const uint32_t now = millis();
-  if (raw != lastRaw) {
-    lastRaw = raw;
-    changedMs = now;
-  }
-  if (now - changedMs >= BUTTON_DEBOUNCE_MS && raw != stable) {
-    stable = raw;
-    if (stable == LOW && now - lastFireMs > BUTTON_LOCKOUT_MS) {
-      lastFireMs = now;
-      Cmd c{CMD_BUTTON, {0}, 0};
-      enqueue(c);
-    }
-  }
+  Serial.println("listening on TCP 5005 — press D7 for the bench clip");
 }
 
 void loop() {
-  server.handleClient();
-  pollButton();
-  const bool connected = WiFi.status() == WL_CONNECTED;
-  digitalWrite(LED_PIN, connected ? HIGH : LOW);
-  if (connected && !mdnsStarted) {
-    mdnsStarted = MDNS.begin(HOSTNAME);
-    if (mdnsStarted) MDNS.addService("http", "tcp", 80);
+  if (WiFi.status() != WL_CONNECTED) {           // keep WiFi alive
+    Serial.println("wifi lost — reconnecting");
+    WiFi.reconnect();
+    delay(500);
+    return;
   }
-  delay(2);
+
+  WiFiClient client = server.accept();
+  if (client) {
+    Serial.printf("client %s\n", client.remoteIP().toString().c_str());
+    handleClient(client);
+    client.stop();
+    Serial.println("client gone");
+  }
+
+  // bench button still plays the embedded clip without the PC
+  static bool btnWas = HIGH;
+  bool btn = digitalRead(PIN_BTN);
+  if (btnWas == HIGH && btn == LOW) playClip();
+  btnWas = btn;
 }
